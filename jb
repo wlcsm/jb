@@ -1,0 +1,134 @@
+#!/bin/sh
+# A simple script to manage background tasks
+#
+# Will Cashman 2022
+
+JB_DIR=$HOME/.jb
+if [ -n "$XDG_DATA_HOME" ]; then
+	JB_DIR=$XDG_DATA_HOME/jb
+fi
+
+# Stores information about the processes
+# Just a TSV file containing three columns: 
+# 1. Job ID:  set by this program
+# 1. Status:  whether the process is still running
+# 2. PID:     process id
+# 3. Command: the command used to start the process
+JB_FILE=$JB_DIR/data.tsv
+
+usage() {
+	NAME=$(basename "$0")
+	echo "usage: $NAME <command> [args]
+
+commands:
+	run <command>   run command in background
+	log <pid>       outputs the contents of the log file for that process
+	list            list jobs
+	clear           removes stopped jobs from listing and deletes logs
+
+$NAME is a simple script to manage background jobs.
+If the variable exists exists, $NAME will store all data in \$XDG_DATA_DIR/jb,
+otherwise it will default to \$HOME/.jb/. 
+
+Upon running a command it will write both STDOUT and STDERR to the same file in
+the directory as determined above, which can be printed with 
+
+	jb log <job_id>
+
+where <job_id> can be obtained from running
+
+	jb list
+"
+	exit 2
+}
+
+# Checks the $JB_FILE to see if the running jobs have stopped and upates the
+# file accordingly
+update_job_status() {
+	TMP_FILE=$(mktemp)
+
+	awk -F'\t' '{
+		if ($2 != "STOPPED") {
+			status = system("ps " $3 " > /dev/null 2>&1")
+			if (status != 0)
+				$2 = "STOPPED"
+		}
+		print $1 "\t" $2 "\t" $3 "\t" $4
+	}' "$JB_FILE" > "$TMP_FILE"
+
+	mv "$TMP_FILE" "$JB_FILE"
+}
+
+# Get the smallest number from 1 to {number of jobs + 1}, that is not already
+# present
+get_job_id() {
+	JOB_IDS_FILE=$(mktemp)
+	cut "$JB_FILE" -f1 | sort -n > "$JOB_IDS_FILE"
+
+	NUM_JOBS=$(cat "$JOB_IDS_FILE" | wc -l)
+	TMP=$(mktemp)
+	seq $(( NUM_JOBS = NUM_JOBS + 1 )) > "$TMP"
+
+	# print the first number from 1..#Jobs+1 that isn't in $JOBS_IDS_FILE
+	comm -23 "$TMP" "$JOB_IDS_FILE" | head -n1
+}
+
+# Ensure files and directories exist
+mkdir -p "$JB_DIR"
+[ -f "$JB_FILE" ] || touch "$JB_FILE"
+
+case "$1" in
+	list) 
+		update_job_status
+
+		if [ -s "$JB_FILE" ]; then
+			printf "JOB ID\tSTATUS\tPID\tCOMMAND\n"
+			cat "$JB_FILE"
+		else
+			echo no jobs running
+		fi
+		;;
+	run) 
+		[ -z "$2" ] && usage
+		shift
+
+		JOB_ID=$(get_job_id)
+		nohup $@ > "$JB_DIR/$JOB_ID" 2>&1 &
+		PID=$!
+
+		# since $@ might have spaces, we need to use a separate echo to
+		# handle it
+		printf "%s\tRUNNING\t%s\t" "$JOB_ID" "$PID" >> "$JB_FILE"
+		echo "$@" >> "$JB_FILE"
+
+		echo "$JOB_ID"
+		;;
+	clear) 
+		update_job_status
+
+		# remove stopped processes from the listing
+		STOPPED_JOBS=$(sed -n "/^[0-9]\+\tSTOPPED/p" "$JB_FILE" \
+			| cut -f1 | tr '\n' ' ')
+
+		# intentionally want to allow the STOPPED_JOBS variable to
+		# expand to multiple files
+		if [ -n "$STOPPED_JOBS" ]; then
+			(cd "$JB_DIR" || exit 3; rm $STOPPED_JOBS)
+		fi
+
+		sed -i'' '/^[0-9]\+\tSTOPPED/d' "$JB_FILE"
+		;;
+	log) 
+		[ "$#" -ne 2 ] && usage
+
+		LOGFILE="$JB_DIR/$2"
+
+		if [ -f "$LOGFILE" ]; then
+			cat "$LOGFILE"
+		else
+			echo "no job with id: $2"
+			exit 1
+		fi
+		;;
+	*) usage
+esac
